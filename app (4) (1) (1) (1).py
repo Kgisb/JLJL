@@ -2685,8 +2685,7 @@ elif view == "Lead Movement":
 
     # Compute inactivity days from chosen reference column
     d_work["_ref_dt"] = coerce_datetime(d_work[ref_col])
-    # Safe diff: NaT -> NaN
-    d_work["_days_since"] = (pd.Timestamp(today) - d_work["_ref_dt"]).dt.days
+    d_work["_days_since"] = (pd.Timestamp(today) - d_work["_ref_dt"]).dt.days  # NaT-safe diff
 
     # ---- Slider (inactivity range)
     valid_days = d_work["_days_since"].dropna()
@@ -2694,7 +2693,6 @@ elif view == "Lead Movement":
         min_d, max_d = 0, 90
     else:
         min_d, max_d = int(valid_days.min()), int(valid_days.max())
-        # clean bounds
         min_d = min(0, min_d)
         max_d = max(1, max_d)
     days_low, days_high = st.slider(
@@ -2949,12 +2947,23 @@ elif view == "Lead Movement":
         )
         st.altair_chart(chart_owner_split, use_container_width=True)
 
-    # Additional chart: Owner on X-axis, stacked by bucket
+    # ================= Option: Exclude Unknown on Owner-on-X chart =================
     st.markdown("#### Inactivity distribution — stacked by Bucket (Owner on X-axis)")
-    owner_x_bucket = (
-        d_top.groupby(["_owner", "Bucket"])
-             .size().reset_index(name="Count")
+    exclude_unknown_owner = st.checkbox(
+        "Exclude ‘Unknown’ owners from this chart",
+        value=True,
+        key="lm_owner_exclude_unknown_xaxis"
     )
+
+    owner_x_df = d_top.copy()
+    if exclude_unknown_owner:
+        owner_x_df = owner_x_df[owner_x_df["_owner"] != "Unknown"]
+
+    owner_x_bucket = (
+        owner_x_df.groupby(["_owner", "Bucket"])
+                  .size().reset_index(name="Count")
+    )
+
     chart_owner_x = (
         alt.Chart(owner_x_bucket)
         .mark_bar(opacity=0.9)
