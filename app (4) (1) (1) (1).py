@@ -105,6 +105,22 @@ def coerce_datetime(series: pd.Series) -> pd.Series:
                 pass
     return s
 
+# >>> NEW robust helpers for date comparison <<<
+def _ensure_datetime_series(s: pd.Series) -> pd.Series:
+    """Coerce to timezone-naive datetime64[ns] safely (handles Period, strings, NaT)."""
+    if pd.api.types.is_period_dtype(s):
+        s = s.dt.to_timestamp()
+    return pd.to_datetime(s, errors="coerce")
+
+def between_dates_series(s: pd.Series, start_d, end_d) -> pd.Series:
+    """Safe 'between' for any date-like series (inclusive)."""
+    s_dt = _ensure_datetime_series(s)
+    start_ts = pd.to_datetime(start_d)
+    # inclusive end-of-day
+    end_ts   = pd.to_datetime(end_d) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return s_dt.between(start_ts, end_ts, inclusive="both")
+# <<< END new helpers >>>
+
 def month_bounds(d: date):
     start = date(d.year, d.month, 1)
     end = date(d.year, d.month, monthrange(d.year, d.month)[1])
@@ -166,12 +182,11 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio(
         "Go to",
-        ["Dashboard", "MIS", "Predictibility", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Daily business", "Lead Movement"],  # ← add this
+        ["Dashboard", "MIS", "Predictibility", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Daily business", "Lead Movement"],
         index=0
     )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
     st.caption("Use MIS for status; Predictibility for forecast; Trend & Analysis for grouped drilldowns; 80-20 for Pareto & Mix.")
-
 
 st.title("📊 JetLearn – Unified App")
 
@@ -227,7 +242,6 @@ cal_resched_col     = find_col(df, ["Calibration Rescheduled Date","Calibration 
 cal_done_col        = find_col(df, ["Calibration Done Date","Calibration done date","Calibration_Done_Date"])
 calibration_slot_col = find_col(df, ["Calibration Slot (Deal)", "Calibration Slot", "Cal Slot (Deal)", "Cal Slot"])
 
-
 if not create_col or not pay_col:
     st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
     st.stop()
@@ -252,7 +266,6 @@ def prep_options(series: pd.Series):
     return ["All"] + vals
 
 with st.expander("Filters (apply to MIS / Predictibility / Trend & Analysis)", expanded=False):
-    
     if counsellor_col:
         sel_counsellors = st.multiselect("Academic Counsellor", options=prep_options(df[counsellor_col]), default=["All"])
     else:
@@ -317,9 +330,9 @@ def prepare_counts_for_range(
     d["_create_dt"] = coerce_datetime(d[create_col])
     d["_pay_dt"] = coerce_datetime(d[pay_col])
 
-    in_range_pay = d["_pay_dt"].dt.date.between(start_d, end_d)
+    in_range_pay = between_dates_series(d["_pay_dt"], start_d, end_d)
     m_start, m_end = month_bounds(month_for_mtd)
-    in_month_create = d["_create_dt"].dt.date.between(m_start, m_end)
+    in_month_create = between_dates_series(d["_create_dt"], m_start, m_end)
 
     cohort_df = d.loc[in_range_pay]
     mtd_df = d.loc[in_range_pay & in_month_create]
@@ -328,8 +341,8 @@ def prepare_counts_for_range(
         cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
         mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
     else:
-        cohort_split = pd.Series([], dtype=object)
-        mtd_split = pd.Series([], dtype=object)
+        cohort_split = pd.Series([], dtype=object, index=cohort_df.index)
+        mtd_split = pd.Series([], dtype=object, index=mtd_df.index)
 
     cohort_counts = {
         "Total": int(len(cohort_df)),
@@ -345,8 +358,8 @@ def prepare_counts_for_range(
 
 def deals_created_mask_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> pd.Series:
     d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    return d["_create_dt"].between(denom_start, denom_end)
+    d["_create_dt"] = coerce_datetime(d[create_col])
+    return between_dates_series(d["_create_dt"], denom_start, denom_end)
 
 def prepare_conversion_for_range(
     df: pd.DataFrame,
@@ -360,26 +373,32 @@ def prepare_conversion_for_range(
     denom_end: date
 ):
     d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
+    d["_create_dt"] = coerce_datetime(d[create_col])
+    d["_pay_dt"] = coerce_datetime(d[pay_col])
 
-    denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
+    denom_mask = between_dates_series(d["_create_dt"], denom_start, denom_end)
 
     if pipeline_col and pipeline_col in d.columns:
         pl = d[pipeline_col].map(normalize_pipeline).fillna("Other")
     else:
         pl = pd.Series(["Other"] * len(d), index=d.index)
 
-    den_total = int(denom_mask.sum()); den_ai = int((denom_mask & (pl == "AI Coding")).sum()); den_math = int((denom_mask & (pl == "Math")).sum())
+    den_total = int(denom_mask.sum())
+    den_ai = int((denom_mask & (pl == "AI Coding")).sum())
+    den_math = int((denom_mask & (pl == "Math")).sum())
     denoms = {"Total": den_total, "AI Coding": den_ai, "Math": den_math}
 
-    pay_mask = d["_pay_dt"].between(start_d, end_d)
+    pay_mask = between_dates_series(d["_pay_dt"], start_d, end_d)
 
     mtd_mask = pay_mask & denom_mask
-    mtd_total = int(mtd_mask.sum()); mtd_ai = int((mtd_mask & (pl == "AI Coding")).sum()); mtd_math = int((mtd_mask & (pl == "Math")).sum())
+    mtd_total = int(mtd_mask.sum())
+    mtd_ai = int((mtd_mask & (pl == "AI Coding")).sum())
+    mtd_math = int((mtd_mask & (pl == "Math")).sum())
 
     coh_mask = pay_mask
-    coh_total = int(coh_mask.sum()); coh_ai = int((coh_mask & (pl == "AI Coding")).sum()); coh_math = int((coh_mask & (pl == "Math")).sum())
+    coh_total = int(coh_mask.sum())
+    coh_ai = int((coh_mask & (pl == "AI Coding")).sum())
+    coh_math = int((coh_mask & (pl == "Math")).sum())
 
     def pct(n, d):
         if d == 0: return 0.0
@@ -387,7 +406,10 @@ def prepare_conversion_for_range(
 
     mtd_pct = {"Total": pct(mtd_total, den_total), "AI Coding": pct(mtd_ai, den_ai), "Math": pct(mtd_math, den_math)}
     coh_pct = {"Total": pct(coh_total, den_total), "AI Coding": pct(coh_ai, den_ai), "Math": pct(coh_math, den_math)}
-    numerators = {"mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math}, "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
+    numerators = {
+        "mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math},
+        "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math},
+    }
     return mtd_pct, coh_pct, denoms, numerators
 
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labels: list[str] = None):
@@ -441,35 +463,38 @@ def trend_timeseries(
     pay_col: str = ""
 ):
     df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
-    df["_pay_dt"] = coerce_datetime(df[pay_col]).dt.date
+    df["_create_dt"] = coerce_datetime(df[create_col])
+    df["_pay_dt"] = coerce_datetime(df[pay_col])
 
     base_start = min(payments_start, denom_start)
     base_end = max(payments_end, denom_end)
-    denom_mask = df["_create_dt"].between(denom_start, denom_end)
+    denom_mask = between_dates_series(df["_create_dt"], denom_start, denom_end)
 
     all_days = pd.date_range(base_start, base_end, freq="D").date
 
     leads = (
-        df.loc[denom_mask]
-          .groupby("_create_dt")
-          .size()
+        df.loc[denom_mask, "_create_dt"]
+          .dt.date
+          .value_counts()
           .reindex(all_days, fill_value=0)
+          .sort_index()
           .rename("Leads")
     )
-    pay_mask = df["_pay_dt"].between(payments_start, payments_end)
+    pay_mask = between_dates_series(df["_pay_dt"], payments_start, payments_end)
     cohort = (
-        df.loc[pay_mask]
-          .groupby("_pay_dt")
-          .size()
+        df.loc[pay_mask, "_pay_dt"]
+          .dt.date
+          .value_counts()
           .reindex(all_days, fill_value=0)
+          .sort_index()
           .rename("Cohort")
     )
     mtd = (
-        df.loc[pay_mask & denom_mask]
-          .groupby("_pay_dt")
-          .size()
+        df.loc[pay_mask & denom_mask, "_pay_dt"]
+          .dt.date
+          .value_counts()
           .reindex(all_days, fill_value=0)
+          .sort_index()
           .rename("MTD")
     )
 
@@ -608,7 +633,6 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
         df_work[source_col] = "All"
     else:
         df_work = df_f.copy()
-        # include blank/NaN deal sources as "Unknown" so they are counted
         df_work[source_col] = df_work[source_col].fillna("Unknown").astype(str)
 
     d = add_month_cols(df_work, create_col, pay_col)
@@ -620,7 +644,6 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     if d_cur.empty:
         realized_by_src = pd.DataFrame(columns=[source_col, "A"])
     else:
-        # include Unknown deal source in Actual-to-date
         realized_by_src = (
             d_cur.assign(**{source_col: d_cur[source_col].fillna("Unknown").astype(str)})
                 .groupby(source_col).size().rename("A").reset_index()
@@ -675,11 +698,9 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     }
     return tbl, totals
 
-
-
 def predict_chart_stacked(tbl: pd.DataFrame):
     if tbl.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))  # empty chart
     melt = tbl.melt(
         id_vars=["Source"],
         value_vars=["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths"],
@@ -768,7 +789,7 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
 
 def accuracy_scatter(bt: pd.DataFrame):
     if bt.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))  # empty chart
     chart = alt.Chart(bt).mark_circle(size=120, opacity=0.8).encode(
         x=alt.X("Actual:Q", title="Actual (month total)"),
         y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
@@ -799,7 +820,7 @@ def build_pareto(df: pd.DataFrame, group_col: str, label: str) -> pd.DataFrame:
 
 def pareto_chart(tbl: pd.DataFrame, label: str, title: str):
     if tbl.empty:
-        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))  # empty chart
     base = alt.Chart(tbl).encode(x=alt.X(f"{label}:N", sort=list(tbl[label])))
     bars = base.mark_bar(opacity=0.85).encode(
         y=alt.Y("Count:Q", axis=alt.Axis(title="Enrollments (count)")),
@@ -995,7 +1016,6 @@ elif view == "Predictibility":
         # Normalized datetime and age in days (relative to today)
         s = coerce_datetime(df_f[col_pick])
         today_ts = pd.Timestamp(date.today())
-        # convert to age (days); future dates become negative ⇒ clip to 0 so they don't get counted accidentally
         age_days = (today_ts - s).dt.days
         age_days = age_days.where(s.notna(), np.nan).clip(lower=0)
 
@@ -1046,6 +1066,7 @@ elif view == "Predictibility":
                 file_name=f"inactivity_snapshot_{'activity' if pick=='Last Activity Date' else 'connected'}_ge_{thr}d.csv",
                 mime="text/csv",
             )
+
 
 elif view == "Trend & Analysis":
     st.subheader("Trend & Analysis – Grouped Drilldowns (Final rules)")
