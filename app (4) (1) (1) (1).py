@@ -3153,10 +3153,253 @@ elif view == "AC Wise Detail":
                 mime="text/csv",
                 key="ac_stack_dl_conv"
             )
-elif view == "Dashboard":
+# app.py
+# JetLearn – Dashboard + 80/20 + Mix Analyzer (with robust date windowing)
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
+from datetime import date, timedelta
+from calendar import monthrange
+import re
+
+st.set_page_config(page_title="JetLearn Dashboard + 80/20 + Mix", page_icon="📈", layout="wide")
+
+# ----------------------------
+# Styling
+# ----------------------------
+st.markdown(
+    """
+    <style>
+      .kpi-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        padding: 12px 14px;
+        background: #fafafa;
+      }
+      .kpi-title { color:#6b7280; font-size:.9rem; margin-bottom:6px; }
+      .kpi-value { font-weight:700; font-size:1.4rem; color:#111827; }
+      .kpi-sub   { color:#6b7280; font-size:.85rem; }
+      .section-title {
+        font-weight: 700; font-size: 1.05rem;
+        margin-top: .25rem; margin-bottom: .5rem;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+def find_col(df: pd.DataFrame, candidates) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    low = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in low:
+            return low[c.lower()]
+    return None
+
+def coerce_datetime(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors="coerce", infer_datetime_format=True, dayfirst=True)
+    if s.notna().sum() == 0:
+        for unit in ["s", "ms"]:
+            try:
+                s = pd.to_datetime(series, errors="coerce", unit=unit)
+                break
+            except Exception:
+                pass
+    return s
+
+def month_bounds(d: date):
+    start = date(d.year, d.month, 1)
+    end = date(d.year, d.month, monthrange(d.year, d.month)[1])
+    return start, end
+
+def last_month_bounds(today: date):
+    first_this = date(today.year, today.month, 1)
+    last_prev = first_this - timedelta(days=1)
+    return month_bounds(last_prev)
+
+def months_back_list(end_d: date, k: int):
+    p_end = pd.Period(end_d, freq="M")
+    return [p_end - i for i in range(k-1, -1, -1)]
+
+# --- Robust date-range mask (fixes dtype mismatch) ---
+def in_window(series_dt, start_d, end_d):
+    """
+    Inclusive [start_d, end_d] mask for any datetime-like series.
+    Converts both sides to pandas Timestamp (normalized to midnight).
+    """
+    s = pd.to_datetime(series_dt, errors="coerce").dt.normalize()
+    start_ts = pd.Timestamp(start_d)
+    end_ts   = pd.Timestamp(end_d)
+    return s.between(start_ts, end_ts)
+
+INVALID_RE = re.compile(r"^\s*1\.2\s*invalid\s*deal[s]?\s*$", re.IGNORECASE)
+
+def exclude_invalid(df: pd.DataFrame, dealstage_col: str | None) -> tuple[pd.DataFrame, int]:
+    if not dealstage_col:
+        return df, 0
+    col = df[dealstage_col].astype(str)
+    keep = ~col.apply(lambda x: bool(INVALID_RE.match(x)))
+    return df.loc[keep].copy(), int((~keep).sum())
+
+# ---- Normalize 3 key sources for PM & Referral buckets ----
+def normalize_key_source(val: str) -> str:
+    if not isinstance(val, str):
+        return "Other"
+    v = val.strip().lower()
+    if "referr" in v:
+        return "Referral"
+    if "pm" in v and "search" in v:
+        return "PM - Search"
+    if "pm" in v and "social" in v:
+        return "PM - Social"
+    return "Other"
+
+# ---- Minimal pipeline normalizer used by predictability box ----
+def normalize_pipeline(value: str) -> str:
+    if not isinstance(value, str):
+        return "Other"
+    v = value.strip().lower()
+    if "math" in v:
+        return "Math"
+    if "ai" in v or "coding" in v:
+        return "AI Coding"
+    return "Other"
+
+# ---- Predictability helpers (lightweight, enough for dashboard box) ----
+def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(df[create_col]) if create_col else pd.NaT
+    d["_pay_dt"]    = coerce_datetime(df[pay_col]) if pay_col else pd.NaT
+    d["_pay_m"]     = d["_pay_dt"].dt.to_period("M")
+    return d
+
+def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
+    if d_hist.empty:
+        return {}, {}, 0.0, 0.0
+    # overall average per-day payments (no per-source breakdown here to keep it lightweight)
+    by_m = d_hist.groupby("_pay_m").size().rename("cnt").reset_index()
+    by_m["days"] = by_m["_pay_m"].apply(lambda p: monthrange(p.year, p.month)[1])
+    w = np.arange(1, len(by_m)+1) if weighted else np.ones(len(by_m))
+    same_rate_o = float(((by_m["cnt"]/by_m["days"]) * w).sum() / w.sum()) if w.sum() > 0 else 0.0
+    prev_rate_o = 0.0  # simple split (all into same_rate for brevity)
+    return {}, {}, same_rate_o, prev_rate_o
+
+def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
+                          lookback: int, weighted: bool, today: date):
+    d = add_month_cols(df_f, create_col, pay_col)
+    cur_start, cur_end = month_bounds(today)
+    cur_period = pd.Period(today, freq="M")
+    d_cur = d[d["_pay_m"] == cur_period].copy()
+    A = float(len(d_cur))  # actual to date
+
+    d_hist = d[d["_pay_m"] < cur_period].copy()
+    _, _, same_rate_o, prev_rate_o = daily_rates_from_lookback(d_hist, source_col, lookback, weighted)
+
+    elapsed_days = (today - cur_start).days + 1
+    total_days   = (cur_end - cur_start).days + 1
+    remaining    = max(0, total_days - elapsed_days)
+
+    B = same_rate_o * remaining
+    C = prev_rate_o * remaining
+
+    # table with single "All" row
+    tbl = pd.DataFrame([{
+        "Source": "All",
+        "A_Actual_ToDate": A,
+        "B_Remaining_SameMonth": B,
+        "C_Remaining_PrevMonths": C,
+        "Projected_MonthEnd_Total": A + B + C,
+        "Rate_Same_Daily": same_rate_o,
+        "Rate_Prev_Daily": prev_rate_o,
+        "Remaining_Days": remaining
+    }])
+    totals = {
+        "A_Actual_ToDate": A,
+        "B_Remaining_SameMonth": B,
+        "C_Remaining_PrevMonths": C,
+        "Projected_MonthEnd_Total": A + B + C,
+        "Remaining_Days": remaining
+    }
+    return tbl, totals
+
+# ----------------------------
+# Load data
+# ----------------------------
+st.title("📈 JetLearn – Dashboard + 80/20 + Mix")
+
+DATA_PATH = "Master_sheet-DB.csv"  # file must be in same folder
+df_raw = load_csv(DATA_PATH)
+
+# Column mapping
+dealstage_col = find_col(df_raw, ["Deal Stage","Deal stage","Stage","Deal Status","Stage Name","Deal Stage Name"])
+create_col    = find_col(df_raw, ["Create Date","Create date","Create_Date","Created At"])
+pay_col       = find_col(df_raw, ["Payment Received Date","Payment Received date","Payment_Received_Date","Payment Date","Paid At"])
+source_col    = find_col(df_raw, ["JetLearn Deal Source","Deal Source","Source"])
+country_col   = find_col(df_raw, ["Country"])
+pipeline_col  = find_col(df_raw, ["Pipeline"])
+
+df_clean, removed_invalid = exclude_invalid(df_raw, dealstage_col)
+if removed_invalid > 0:
+    st.caption(f"Auto-excluded “1.2 Invalid deal(s)”: **{removed_invalid:,}** rows.")
+
+# Precompute core datetime columns
+df_clean["_pay_dt"]    = coerce_datetime(df_clean[pay_col]) if pay_col else pd.NaT
+df_clean["_create_dt"] = coerce_datetime(df_clean[create_col]) if create_col else pd.NaT
+df_clean["_pay_m"]     = df_clean["_pay_dt"].dt.to_period("M")
+
+# ----------------------------
+# Sidebar: top-level view switch & (minimal) filters
+# ----------------------------
+view = st.sidebar.radio("Go to", ["Dashboard", "80/20 & Mix"], index=0)
+st.sidebar.caption("Data file: Master_sheet-DB.csv")
+
+# (Optional) global simple filters (can be extended)
+sel_counsellors = []  # kept for compatibility with dynamic targets in dashboard
+track = "Both"        # kept for compatibility
+
+# For 80/20 & Mix: let user pick cohort window
+if view == "80/20 & Mix":
+    st.sidebar.header("Cohort window (Payments)")
+    unique_months = df_clean["_pay_dt"].dropna().dt.to_period("M").drop_duplicates().sort_values()
+    month_labels = [str(p) for p in unique_months]
+    use_custom = st.sidebar.toggle("Use custom date range", value=False)
+
+    if not use_custom and len(month_labels) > 0:
+        month_pick = st.sidebar.selectbox("Cohort month", month_labels, index=len(month_labels)-1)
+        y, m = map(int, month_pick.split("-"))
+        start_d = date(y, m, 1)
+        end_d = date(y, m, monthrange(y, m)[1])
+    else:
+        default_start = (df_clean["_pay_dt"].min().normalize().date()
+                         if df_clean["_pay_dt"].notna().any() else date.today().replace(day=1))
+        default_end   = (df_clean["_pay_dt"].max().normalize().date()
+                         if df_clean["_pay_dt"].notna().any() else date.today())
+        start_d = st.sidebar.date_input("Start date", value=default_start)
+        end_d   = st.sidebar.date_input("End date", value=default_end)
+        if end_d < start_d:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+# ----------------------------
+# VIEW: Dashboard
+# ----------------------------
+if view == "Dashboard":
     st.subheader("Dashboard – Key Business Snapshot")
 
-    # --- Cash-in table from Google Sheet ---
+    # --- Cash-in table from Google Sheet (optional) ---
     st.markdown("### This Month Cash-in")
     SHEET_ID = "1tw6gTaUEycAD5DJjw5ASSdF-WwYEt2TqcMb2lTKtKps"   # your sheet ID
     GID = "0"   # tab gid
@@ -3179,16 +3422,15 @@ elif view == "Dashboard":
 
     st.divider()
 
-    # Guards
+    # Guard for required columns
     if not create_col or not pay_col:
         st.error("Required columns missing: Create Date / Payment Received Date.")
         st.stop()
 
-    # Prep frame (filtered scope already applied in df_f)
-    d = df_f.copy()
-    d["_c"] = coerce_datetime(d[create_col])
-    d["_p"] = coerce_datetime(d[pay_col])
-
+    # Prep frame (use full cleaned data here; you can wire in filters if you have them)
+    d = df_clean.copy()
+    d["_c"] = d["_create_dt"]
+    d["_p"] = d["_pay_dt"]
     if source_col and source_col in d.columns:
         d["_src"] = d[source_col].fillna("Unknown").astype(str)
     else:
@@ -3206,22 +3448,18 @@ elif view == "Dashboard":
         ("This Month (MTD)", this_m_start, date.today())
     ]
 
-    # Small helper – build a compact KPI block with two mini visuals
+    # KPI block (uses in_window to avoid dtype issues)
     def kpi_block(title, start_d: date, end_d: date):
-        # Window masks (robust comparisons)
+        # Window masks
         c_in = in_window(d["_c"], start_d, end_d)
         p_in = in_window(d["_p"], start_d, end_d)
 
-        # Totals
         created_total = int(c_in.sum())
         cohort_pay    = int(p_in.sum())
 
-        # Same-deal payments (payments within window from deals created within window)
+        # Payments within window from deals created within window
         base_same = d.loc[c_in, ["_c","_p","_src"]].copy()
-        if not base_same.empty:
-            same_pay = int(in_window(base_same["_p"], start_d, end_d).sum())
-        else:
-            same_pay = 0
+        same_pay = int(in_window(base_same["_p"], start_d, end_d).sum()) if not base_same.empty else 0
 
         # Referral slices
         ref_mask_created = c_in & d["_src"].str.contains("referr", case=False, na=False)
@@ -3236,7 +3474,7 @@ elif view == "Dashboard":
         else:
             ref_pay_same = 0
 
-        # Mini charts (circles): Payments – Same-deal vs Cohort & Referral Same vs Cohort
+        # Mini charts
         mini1 = alt.Chart(pd.DataFrame({
             "Type": ["Payments – Same-deal", "Payments – Cohort"],
             "Value": [same_pay, cohort_pay]
@@ -3289,43 +3527,27 @@ elif view == "Dashboard":
         with cc2:
             st.altair_chart(mini2, use_container_width=True)
 
-    # Render the four period blocks (two per row)
-    row1, row2 = st.columns(2)
-    with row1:
+    # Render
+    colA, colB = st.columns(2)
+    with colA:
         kpi_block("Yesterday", PERIODS[0][1], PERIODS[0][2])
-    with row2:
+    with colB:
         kpi_block("Today", PERIODS[1][1], PERIODS[1][2])
 
     st.divider()
-    row3, row4 = st.columns(2)
-    with row3:
+    colC, colD = st.columns(2)
+    with colC:
         kpi_block("Last Month", PERIODS[2][1], PERIODS[2][2])
-    with row4:
+    with colD:
         kpi_block("This Month (MTD)", PERIODS[3][1], PERIODS[3][2])
 
-    # ---- Predictability (this month) box ----
+    # ---- Predictability (this month)
     st.markdown("<div class='section-title'>Predictability — This Month</div>", unsafe_allow_html=True)
-
-    # Helper: dynamic targets based on Academic Counsellor global filter
-    def get_dynamic_targets(sel_counsellors_list):
-        if sel_counsellors_list and ("All" not in sel_counsellors_list):
-            ai_tgt, math_tgt = 20, 8
-        else:
-            ai_tgt, math_tgt = 150, 50
-        return {"AI Coding": ai_tgt, "Math": math_tgt, "Total": ai_tgt + math_tgt}
-
-    dynamic_targets = get_dynamic_targets(sel_counsellors)
-    tgt_ai   = float(dynamic_targets["AI Coding"])
-    tgt_math = float(dynamic_targets["Math"])
-    tgt_tot  = float(dynamic_targets["Total"])
-
-    # Forecast from predict_running_month
     lookback = 3
     weighted = True
     tbl_pred, totals_pred = predict_running_month(
-        df_f, create_col, pay_col, source_col, lookback, weighted, today=date.today()
+        df_clean, create_col, pay_col, source_col, lookback, weighted, today=date.today()
     )
-
     A = float(totals_pred.get("A_Actual_ToDate", 0.0))
     B = float(totals_pred.get("B_Remaining_SameMonth", 0.0))
     C = float(totals_pred.get("C_Remaining_PrevMonths", 0.0))
@@ -3335,104 +3557,18 @@ elif view == "Dashboard":
     elapsed_days = (date.today() - cur_start).days + 1
     total_days   = (cur_end - cur_start).days + 1
     remaining_days = max(0, total_days - elapsed_days)
-
     avg_actual_per_day    = A / elapsed_days if elapsed_days > 0 else 0.0
     avg_projected_per_day = projected / total_days if total_days > 0 else 0.0
 
-    d_m = add_month_cols(df_f, create_col, pay_col)
-    cur_period = pd.Period(date.today(), freq="M")
-    cur_paid = d_m[d_m["_pay_m"] == cur_period].copy()
-
-    if pipeline_col and (pipeline_col in cur_paid.columns):
-        pl_series = cur_paid[pipeline_col].map(normalize_pipeline).fillna("Other")
-    else:
-        pl_series = pd.Series(["Other"] * len(cur_paid), index=cur_paid.index)
-
-    A_ai   = float((pl_series == "AI Coding").sum())
-    A_math = float((pl_series == "Math").sum())
-
-    if track == "AI Coding":
-        target_total = tgt_ai
-        gap_total = max(0.0, target_total - A)
-        req_avg_total_per_day = (gap_total / remaining_days) if remaining_days > 0 else (0.0 if gap_total <= 0 else float("inf"))
-        show_per_pipeline_panels = False
-        target_subtitle = "AI Coding target"
-    elif track == "Math":
-        target_total = tgt_math
-        gap_total = max(0.0, target_total - A)
-        req_avg_total_per_day = (gap_total / remaining_days) if remaining_days > 0 else (0.0 if gap_total <= 0 else float("inf"))
-        show_per_pipeline_panels = False
-        target_subtitle = "Math target"
-    else:
-        target_total = tgt_tot
-        gap_total = max(0.0, target_total - A)
-        req_avg_total_per_day = (gap_total / remaining_days) if remaining_days > 0 else (0.0 if gap_total <= 0 else float("inf"))
-        show_per_pipeline_panels = True
-        target_subtitle = f"AI {int(tgt_ai)} + Math {int(tgt_math)}"
-
     p1, p2, p3, p4 = st.columns(4)
     with p1:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div>"
-            f"<div class='kpi-value'>{A:.1f}</div>"
-            f"<div class='kpi-sub'>{cur_start} → {date.today()}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value'>{A:.1f}</div><div class='kpi-sub'>{cur_start} → {date.today()}</div></div>", unsafe_allow_html=True)
     with p2:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End (A+B+C)</div>"
-            f"<div class='kpi-value'>{projected:.1f}</div>"
-            f"<div class='kpi-sub'>Remaining days: {remaining_days}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End</div><div class='kpi-value'>{projected:.1f}</div><div class='kpi-sub'>A + B + C • Rem days: {remaining_days}</div></div>", unsafe_allow_html=True)
     with p3:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Avg enrolments/day</div>"
-            f"<div class='kpi-value'>{avg_actual_per_day:.2f}</div>"
-            f"<div class='kpi-sub'>Actual so far</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg/day (actual)</div><div class='kpi-value'>{avg_actual_per_day:.2f}</div></div>", unsafe_allow_html=True)
     with p4:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Projected avg/day</div>"
-            f"<div class='kpi-value'>{avg_projected_per_day:.2f}</div>"
-            f"<div class='kpi-sub'>For the full month</div></div>", unsafe_allow_html=True)
-
-    t1, t2 = st.columns(2)
-    with t1:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Target (dynamic)</div>"
-            f"<div class='kpi-value'>{int(target_total)}</div>"
-            f"<div class='kpi-sub'>{target_subtitle}</div></div>", unsafe_allow_html=True)
-    with t2:
-        if np.isfinite(req_avg_total_per_day):
-            st.markdown(
-                f"<div class='kpi-card'><div class='kpi-title'>Required avg/day to hit target</div>"
-                f"<div class='kpi-value'>{req_avg_total_per_day:.2f}</div>"
-                f"<div class='kpi-sub'>Given current A and remaining {remaining_days} days</div></div>", unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f"<div class='kpi-card'><div class='kpi-title'>Required avg/day to hit target</div>"
-                f"<div class='kpi-value'>–</div>"
-                f"<div class='kpi-sub'>Target met or no days left</div></div>", unsafe_allow_html=True)
-
-    if show_per_pipeline_panels:
-        gap_ai   = max(0.0, tgt_ai - A_ai)
-        gap_math = max(0.0, tgt_math - A_math)
-        req_ai_per_day   = (gap_ai / remaining_days) if remaining_days > 0 else (0.0 if gap_ai <= 0 else float("inf"))
-        req_math_per_day = (gap_math / remaining_days) if remaining_days > 0 else (0.0 if gap_math <= 0 else float("inf"))
-
-        q1, q2 = st.columns(2)
-        with q1:
-            req_ai_txt = f"{req_ai_per_day:.2f}" if np.isfinite(req_ai_per_day) else "–"
-            st.markdown(
-                f"<div class='kpi-card'>"
-                f"<div class='kpi-title'>AI Coding — Target {int(tgt_ai)}</div>"
-                f"<div class='kpi-value'>{int(A_ai)}</div>"
-                f"<div class='kpi-sub'>A (MTD payments) • Required/day: <b>{req_ai_txt}</b></div>"
-                f"</div>", unsafe_allow_html=True)
-        with q2:
-            req_math_txt = f"{req_math_per_day:.2f}" if np.isfinite(req_math_per_day) else "–"
-            st.markdown(
-                f"<div class='kpi-card'>"
-                f"<div class='kpi-title'>Math — Target {int(tgt_math)}</div>"
-                f"<div class='kpi-value'>{int(A_math)}</div>"
-                f"<div class='kpi-sub'>A (MTD payments) • Required/day: <b>{req_math_txt}</b></div>"
-                f"</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Avg/day (projected)</div><div class='kpi-value'>{avg_projected_per_day:.2f}</div></div>", unsafe_allow_html=True)
 
     if not tbl_pred.empty:
         melt = tbl_pred.melt(
@@ -3446,7 +3582,166 @@ elif view == "Dashboard":
             y=alt.Y("Value:Q", stack=True, title="Enrolments"),
             color=alt.Color("Component:N", title="Component", legend=alt.Legend(orient="bottom")),
             tooltip=["Source:N","Component:N", alt.Tooltip("Value:Q", format=",.1f")]
-        ).properties(height=300, title=f"Predictability components by source (A, B, C){' — '+track if track!='Both' else ''}")
+        ).properties(height=300, title="Predictability components (A, B, C)")
         st.altair_chart(chart, use_container_width=True)
     else:
         st.info("No running-month payments in scope to visualize predictability components.")
+
+# ----------------------------
+# VIEW: 80/20 & Mix
+# ----------------------------
+if view == "80/20 & Mix":
+    st.subheader("80/20 & Mix Analyzer")
+
+    # Scope
+    scope_mask = in_window(df_clean["_pay_dt"], start_d, end_d)
+    df_scope = df_clean.loc[scope_mask].copy()
+
+    st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Cohort window</div><div class='kpi-value'>{start_d} → {end_d}</div><div class='kpi-sub'>Payments (enrolments) in window: {len(df_scope):,}</div></div>", unsafe_allow_html=True)
+
+    # Pareto by Deal Source / Country
+    def build_pareto(df: pd.DataFrame, group_col: str, label: str) -> pd.DataFrame:
+        if group_col is None or group_col not in df.columns or df.empty:
+            return pd.DataFrame(columns=[label, "Count", "CumCount", "CumPct", "Tag"])
+        tmp = (
+            df.assign(_grp=df[group_col].fillna("Unknown").astype(str))
+              .groupby("_grp").size().sort_values(ascending=False).rename("Count").reset_index()
+              .rename(columns={"_grp": label})
+        )
+        tmp["CumCount"] = tmp["Count"].cumsum()
+        total = tmp["Count"].sum()
+        tmp["CumPct"] = (tmp["CumCount"] / total * 100.0) if total > 0 else 0.0
+        tmp["Tag"] = np.where(tmp["CumPct"] <= 80.0, "Top 80%", "Bottom 20%")
+        return tmp
+
+    def pareto_chart(tbl: pd.DataFrame, label: str, title: str):
+        if tbl.empty:
+            return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+        base = alt.Chart(tbl).encode(x=alt.X(f"{label}:N", sort=list(tbl[label])))
+        bars = base.mark_bar(opacity=0.85).encode(
+            y=alt.Y("Count:Q", axis=alt.Axis(title="Enrollments (count)")),
+            tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip("Count:Q")]
+        )
+        line = base.mark_line(point=True).encode(
+            y=alt.Y("CumPct:Q", axis=alt.Axis(title="Cumulative %", orient="right")),
+            color=alt.value("#16a34a"),
+            tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip("CumPct:Q", format=".1f")]
+        )
+        rule80 = alt.Chart(pd.DataFrame({"y":[80.0]})).mark_rule(strokeDash=[4,4]).encode(y="y:Q")
+        return alt.layer(bars, line, rule80).resolve_scale(y='independent').properties(title=title, height=360)
+
+    src_tbl = build_pareto(df_scope, source_col, "Deal Source")
+    cty_tbl = build_pareto(df_scope, country_col, "Country")
+    c1, c2 = st.columns(2)
+    with c1: st.altair_chart(pareto_chart(src_tbl, "Deal Source", "Pareto – Enrolments by Deal Source"), use_container_width=True)
+    with c2: st.altair_chart(pareto_chart(cty_tbl, "Country", "Pareto – Enrolments by Country"), use_container_width=True)
+
+    st.divider()
+
+    # Interactive Mix Analyzer – pick sources & countries → % of overall
+    st.markdown("### Interactive Mix Analyzer — % of overall business from your selection")
+    cohort_now = df_scope.copy()
+
+    # Source options (key buckets or raw)
+    use_key_sources = st.checkbox("Use key-source mapping (Referral / PM - Search / PM - Social)", value=True)
+    if source_col and source_col in cohort_now.columns:
+        if use_key_sources:
+            cohort_now["_src_pick"] = cohort_now[source_col].apply(normalize_key_source)
+            src_options = ["Referral", "PM - Search", "PM - Social", "Other"]
+            default_srcs = ["Referral", "PM - Search", "PM - Social"]
+        else:
+            cohort_now["_src_pick"] = cohort_now[source_col].fillna("Unknown").astype(str)
+            src_options = sorted(cohort_now["_src_pick"].unique().tolist())
+            default_srcs = cohort_now["_src_pick"].value_counts().head(5).index.tolist()
+        picked_srcs = st.multiselect("Select Deal Sources", options=src_options, default=[s for s in default_srcs if s in src_options])
+    else:
+        picked_srcs = []
+        st.info("Deal Source column not found.")
+
+    # Country options
+    if country_col and country_col in cohort_now.columns:
+        country_counts = cohort_now[country_col].astype(str).fillna("Unknown").value_counts()
+        picked_countries = st.multiselect("Select Countries", options=country_counts.index.tolist(), default=country_counts.head(7).index.tolist())
+    else:
+        picked_countries = []
+        st.info("Country column not found.")
+
+    mix_view = st.radio("Mix view", ["Aggregate (range total)", "Month-wise"], index=0, horizontal=True)
+
+    total_payments = int(len(cohort_now))
+    if total_payments == 0:
+        st.warning("No payments (enrolments) in the selected window.")
+        st.stop()
+
+    # base masks
+    base_mask = pd.Series(True, index=cohort_now.index)
+    if picked_countries and country_col:
+        base_mask &= cohort_now[country_col].astype(str).isin(picked_countries)
+    sources_for_lines = picked_srcs if picked_srcs else (src_options if source_col else [])
+
+    if mix_view == "Aggregate (range total)":
+        agg_mask = base_mask.copy()
+        if sources_for_lines and source_col:
+            agg_mask &= cohort_now["_src_pick"].isin(sources_for_lines)
+        selected_payments = int(agg_mask.sum())
+        pct_of_overall = (selected_payments / total_payments * 100.0) if total_payments > 0 else 0.0
+        st.markdown(
+            f"<div class='kpi-card'>"
+            f"<div class='kpi-title'>Contribution of your selection ({start_d} → {end_d})</div>"
+            f"<div class='kpi-value'>{pct_of_overall:.1f}%</div>"
+            f"<div class='kpi-sub'>Enrolments in selection: {selected_payments:,} • Total: {total_payments:,}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        # Month-wise lines
+        cohort_now["_pay_m"] = cohort_now["_pay_dt"].dt.to_period("M")
+        months_in_range = cohort_now["_pay_m"].dropna().sort_values().unique().astype(str).tolist()
+
+        overall_m = cohort_now.groupby("_pay_m").size().rename("TotalAll").reset_index()
+        overall_m["Month"] = overall_m["_pay_m"].astype(str)
+
+        all_sel_mask = base_mask.copy()
+        if sources_for_lines and source_col:
+            all_sel_mask &= cohort_now["_src_pick"].isin(sources_for_lines)
+        sel_all_m = cohort_now.loc[all_sel_mask].groupby("_pay_m").size().rename("SelCnt").reset_index()
+        sel_all_m["Month"] = sel_all_m["_pay_m"].astype(str)
+
+        all_line = overall_m.merge(sel_all_m[["_pay_m","SelCnt","Month"]], on=["_pay_m","Month"], how="left").fillna({"SelCnt":0})
+        all_line["PctOfOverall"] = np.where(all_line["TotalAll"]>0, all_line["SelCnt"]/all_line["TotalAll"]*100.0, 0.0)
+        all_line["Series"] = "All Selected"
+        all_line = all_line[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
+        all_line["Month"] = pd.Categorical(all_line["Month"], categories=months_in_range, ordered=True)
+
+        per_src_frames = []
+        if source_col and len(sources_for_lines) > 0:
+            for sname in sources_for_lines:
+                smask = base_mask.copy()
+                smask &= (cohort_now["_src_pick"] == sname)
+                s_cnt = cohort_now.loc[smask].groupby("_pay_m").size().rename("SelCnt").reset_index()
+                if s_cnt.empty:
+                    continue
+                s_cnt["Month"] = s_cnt["_pay_m"].astype(str)
+                s_join = overall_m.merge(s_cnt[["_pay_m","SelCnt","Month"]], on=["_pay_m","Month"], how="left").fillna({"SelCnt":0})
+                s_join["PctOfOverall"] = np.where(s_join["TotalAll"]>0, s_join["SelCnt"]/s_join["TotalAll"]*100.0, 0.0)
+                s_join["Series"] = sname
+                s_join = s_join[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
+                s_join["Month"] = pd.Categorical(s_join["Month"], categories=months_in_range, ordered=True)
+                per_src_frames.append(s_join)
+
+        lines_df = pd.concat([all_line] + per_src_frames, ignore_index=True) if per_src_frames else all_line.copy()
+        stroke_width = alt.condition("datum.Series == 'All Selected'", alt.value(4), alt.value(2))
+        chart = alt.Chart(lines_df).mark_line(point=True).encode(
+            x=alt.X("Month:N", sort=months_in_range, title="Month"),
+            y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Series:N", title="Series"),
+            strokeWidth=stroke_width,
+            tooltip=[
+                alt.Tooltip("Month:N"),
+                alt.Tooltip("Series:N"),
+                alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                alt.Tooltip("TotalAll:Q", title="Total enrolments"),
+                alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+            ]
+        ).properties(height=360, title="Month-wise % of overall — All Selected vs each picked source")
+        st.altair_chart(chart, use_container_width=True)
